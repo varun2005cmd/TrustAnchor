@@ -1,67 +1,82 @@
-# TESSERACT
+# TrustAnchor
 
-A zero-trust, HSM-backed Certificate Authority issuance pipeline with M-of-N
-approval and ephemeral (24-72 hour) OCSP Must-Staple certificates.
+TrustAnchor is an educational certificate-authority security pipeline built around
+hardware-backed key protection, multi-party authorization, short-lived
+certificates, and tamper-evident auditing.
 
-**Case study:** the 2011 DigiNotar breach, in which attackers pivoted from public
-web servers into the CA signing infrastructure and issued rogue certificates
-(including `*.google.com`) that went undetected for weeks.
+The project models defenses against unauthorized certificate issuance caused by
+compromised web servers, gateways, or approval systems.
 
-## What it demonstrates
+## Core security controls
 
-| DigiNotar failure | TESSERACT control |
+| Security concern | TrustAnchor control |
 |---|---|
-| CA signing key reachable from a compromised network | CA private keys are generated inside a PKCS#11 token and are non-extractable |
-| One compromised system could issue any certificate | M-of-N (3 of 5) Ed25519 approvals, re-verified by the signer itself |
-| Gateway or front-end compromise | The signer treats the gateway as untrusted and re-derives the domains from the CSR |
-| Rogue issuance for domains nobody approved | Signer-side policy: allowed domains, no wildcards, 72h validity cap |
-| Missing or tampered logs | Hash-chained audit log, including denied requests |
-| Long-lived certificates and slow revocation | 24-72h certificates with the Must-Staple extension |
+| Private CA keys exposed to application systems | Keys are generated inside PKCS#11 tokens and marked non-extractable |
+| A single compromised service can issue certificates | Issuance requires three approvals from a five-person approval group |
+| A gateway alters an approved request | The signer independently validates the CSR and re-derives its domains |
+| Unauthorized or overly broad domains | Signer-side allowlists, wildcard rejection, and validity limits |
+| Missing or modified security records | Hash-chained audit logging, including rejected requests |
+| Long certificate lifetimes | Certificates are limited to 24–72 hours and include OCSP Must-Staple |
 
-## Status
+## Project status
 
-- [x] Phase 1: HSM-backed root and issuing CA (SoftHSM2 via PKCS#11)
-- [x] Phase 2: M-of-N approval gateway, signer, attack tests
-- [ ] Phase 2b: Shamir-split HSM PIN with a sealed/unsealed signer
-- [ ] Phase 3: Network segmentation and mTLS between components
-- [ ] Phase 4: ACME and automated renewal lifecycle manager
-- [ ] Phase 5: OCSP responder, emergency revocation, hard-fail client, issuance monitor
-- [ ] Phase 6: Attack simulation against a DigiNotar-style baseline
+- [x] HSM-backed root and issuing CA using SoftHSM2 and PKCS#11
+- [x] Multi-party approval gateway and signer
+- [x] Automated attack and integrity tests
+- [ ] Shamir-secret sharing for the HSM PIN
+- [ ] Sealed signer service
+- [ ] Network separation and mutual TLS
+- [ ] ACME-based renewal automation
+- [ ] OCSP responder and emergency revocation
+- [ ] Hard-fail client validation
+- [ ] Issuance monitoring
+- [ ] End-to-end attack simulation
 
 ## Architecture
 
-```
-requester.py --> gateway.py --> signer.py --> HSM (issuing key, non-extractable)
-                 (collects      (re-verifies everything,
-approver.py ---> signatures)     then calls the HSM)
+```text
+requester.py --> gateway.py --> signer.py --> HSM
+                  approval       policy       issuing key
+                  collection     checks
+approver.py ----> signatures
 ```
 
-## Repository layout
+The gateway coordinates requests and approvals but is not trusted to enforce
+certificate policy. The signer independently verifies the request, validates
+each approval, checks the CSR, applies issuance restrictions, and requests the
+signature from the HSM.
 
-```
-ca_sign.py        builds root and intermediate certificates; the HSM does the signing
-sign_leaf.py      standalone leaf issuance test (Phase 1)
-extract_test.py   proves the issuing key cannot be read out of the token
-env.sh            sets the PKCS#11 module path
-certs/            public certificates, public keys and CSRs
+## Repository structure
+
+```text
+ca_sign.py        Creates root and intermediate CA certificates
+sign_leaf.py      Performs a standalone leaf-certificate issuance test
+extract_test.py   Verifies that the issuing key cannot be extracted
+env.sh            Defines the PKCS#11 library location
+certs/            Stores public certificates, public keys, and CSRs
+
 mofn/
-  common.py       canonical request format, signature verification helpers
-  keygen.py       creates 5 approver Ed25519 keypairs and the public registry
-  signer.py       policy checks, M-of-N verification, HSM signing, audit log
-  gateway.py      HTTP service that collects approvals
-  requester.py    CLI to submit a CSR and request issuance
-  approver.py     CLI for an approver to review and sign a request
-  attack_tests.py 10 automated attacks against the signer
+  common.py       Canonical request encoding and signature verification
+  keygen.py       Creates the five approval keys and public-key registry
+  signer.py       Applies policy, verifies approvals, signs, and audits
+  gateway.py      HTTP service for collecting approvals
+  requester.py    CLI for submitting and issuing certificate requests
+  approver.py     CLI for reviewing and approving requests
+  attack_tests.py Automated security and tamper-resistance tests
 ```
 
-No private keys are committed. See `.gitignore`. Every PIN in this project is a
-lab-only value.
+Private keys are excluded from version control. All PINs used in this project are
+for local laboratory demonstrations only.
 
 ## Requirements
 
 - Ubuntu on WSL2 or native Linux
-- Python 3.10 or newer, OpenSSL 3.x
-- SoftHSM2, OpenSC (`pkcs11-tool`)
+- Python 3.10 or later
+- OpenSSL 3.x
+- SoftHSM2
+- OpenSC and `pkcs11-tool`
+
+Install the required packages:
 
 ```bash
 sudo apt update
@@ -69,77 +84,108 @@ sudo apt install -y softhsm2 opensc openssl python3-venv python3-full \
                     python-is-python3 build-essential python3-dev libssl-dev git
 ```
 
-## Setup
+## Installation
 
-Keep the project in the Linux filesystem (`~/ca`), not under `/mnt/c`.
+Keep the project inside the Linux filesystem, such as `~/trust-anchor`, rather
+than under `/mnt/c`.
 
-### 1. Python environment
+### 1. Create the Python environment
 
 ```bash
-cd ~/ca
+cd ~/trust-anchor
 python3 -m venv venv
 source venv/bin/activate
 pip install python-pkcs11 cryptography
 ```
 
-### 2. SoftHSM configuration (two separate tokens)
+### 2. Configure SoftHSM2
+
+Two independent tokens are used: one for the root CA and another for the
+issuing CA.
 
 ```bash
-mkdir -p ~/ca/root-hsm/tokens ~/ca/issuing-hsm/tokens ~/ca/certs
+mkdir -p ~/trust-anchor/root-hsm/tokens \
+         ~/trust-anchor/issuing-hsm/tokens \
+         ~/trust-anchor/certs
 
-cat > ~/ca/root.conf <<EOT
-directories.tokendir = $HOME/ca/root-hsm/tokens
+cat > ~/trust-anchor/root.conf <<EOT
+directories.tokendir = $HOME/trust-anchor/root-hsm/tokens
 objectstore.backend = file
 log.level = ERROR
 EOT
 
-cat > ~/ca/issuing.conf <<EOT
-directories.tokendir = $HOME/ca/issuing-hsm/tokens
+cat > ~/trust-anchor/issuing.conf <<EOT
+directories.tokendir = $HOME/trust-anchor/issuing-hsm/tokens
 objectstore.backend = file
 log.level = ERROR
 EOT
 
-cat > ~/ca/env.sh <<'EOT'
+cat > ~/trust-anchor/env.sh <<'EOT'
 export P11MOD=/usr/lib/softhsm/libsofthsm2.so
 EOT
-source ~/ca/env.sh
+
+source ~/trust-anchor/env.sh
 ```
 
-If `/usr/lib/softhsm/libsofthsm2.so` does not exist, find it with
-`ls /usr/lib/*/softhsm/` and update `env.sh`.
-
-### 3. Create the root and issuing keys inside the tokens
+If the PKCS#11 library is installed elsewhere, locate it with:
 
 ```bash
-export SOFTHSM2_CONF=~/ca/root.conf
-softhsm2-util --init-token --free --label rootCA --so-pin 11111111 --pin 1234
-pkcs11-tool --module $P11MOD --token-label rootCA --login --pin 1234 \
-  --keypairgen --key-type EC:secp384r1 --label root-key --id 01
-
-export SOFTHSM2_CONF=~/ca/issuing.conf
-softhsm2-util --init-token --free --label issuingCA --so-pin 22222222 --pin 5678
-pkcs11-tool --module $P11MOD --token-label issuingCA --login --pin 5678 \
-  --keypairgen --key-type EC:secp384r1 --label issuing-key --id 02
+ls /usr/lib/*/softhsm/
 ```
 
-### 4. Export the public keys (public data only)
+Update `env.sh` with the correct path if necessary.
+
+### 3. Generate the CA keys
 
 ```bash
-export SOFTHSM2_CONF=~/ca/root.conf
-pkcs11-tool --module $P11MOD --token-label rootCA --login --pin 1234 \
-  --read-object --type pubkey --label root-key -o certs/root_pub.der
-openssl pkey -pubin -inform DER -in certs/root_pub.der -out certs/root_pub.pem
+export SOFTHSM2_CONF=~/trust-anchor/root.conf
+softhsm2-util --init-token --free --label rootCA \
+  --so-pin 11111111 --pin 1234
 
-export SOFTHSM2_CONF=~/ca/issuing.conf
-pkcs11-tool --module $P11MOD --token-label issuingCA --login --pin 5678 \
-  --read-object --type pubkey --label issuing-key -o certs/issuing_pub.der
-openssl pkey -pubin -inform DER -in certs/issuing_pub.der -out certs/issuing_pub.pem
+pkcs11-tool --module "$P11MOD" --token-label rootCA --login --pin 1234 \
+  --keypairgen --key-type EC:secp384r1 \
+  --label root-key --id 01
+
+export SOFTHSM2_CONF=~/trust-anchor/issuing.conf
+softhsm2-util --init-token --free --label issuingCA \
+  --so-pin 22222222 --pin 5678
+
+pkcs11-tool --module "$P11MOD" --token-label issuingCA --login --pin 5678 \
+  --keypairgen --key-type EC:secp384r1 \
+  --label issuing-key --id 02
 ```
 
-### 5. Build the CA certificates (the HSM signs; keys never leave the token)
+### 4. Export public keys
+
+Only public key material is exported from the tokens.
 
 ```bash
-export SOFTHSM2_CONF=~/ca/root.conf
+export SOFTHSM2_CONF=~/trust-anchor/root.conf
+pkcs11-tool --module "$P11MOD" --token-label rootCA --login --pin 1234 \
+  --read-object --type pubkey --label root-key \
+  -o certs/root_pub.der
+
+openssl pkey -pubin -inform DER \
+  -in certs/root_pub.der \
+  -out certs/root_pub.pem
+
+export SOFTHSM2_CONF=~/trust-anchor/issuing.conf
+pkcs11-tool --module "$P11MOD" --token-label issuingCA --login --pin 5678 \
+  --read-object --type pubkey --label issuing-key \
+  -o certs/issuing_pub.der
+
+openssl pkey -pubin -inform DER \
+  -in certs/issuing_pub.der \
+  -out certs/issuing_pub.pem
+```
+
+### 5. Create the CA certificates
+
+The CA private keys remain inside the tokens while the HSM performs the
+cryptographic signing operation.
+
+```bash
+export SOFTHSM2_CONF=~/trust-anchor/root.conf
 python ca_sign.py root
 python ca_sign.py intermediate
 
@@ -147,142 +193,195 @@ openssl verify -CAfile certs/root.crt certs/root.crt
 openssl verify -CAfile certs/root.crt certs/issuing.crt
 ```
 
-Both must print `OK`. After this, the root token can be taken offline: encrypt
-`root-hsm/`, store it off the machine, and delete it from the running system.
+Both verification commands should return `OK`.
 
-### 6. Create the approver keys (3-of-5)
+After creating the issuing certificate, the root token can be removed from the
+active environment, encrypted, and stored offline.
+
+### 6. Generate approval keys
+
+The demonstration uses a three-of-five approval threshold.
 
 ```bash
-cd ~/ca/mofn && mkdir -p keys && chmod 700 keys
+cd ~/trust-anchor/mofn
+mkdir -p keys
+chmod 700 keys
 python keygen.py
 ```
 
-### 7. Create a test CSR
+### 7. Generate a test CSR
 
 ```bash
-cd ~/ca
-openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout certs/leaf.key -subj "/CN=test.local" \
-  -addext "subjectAltName=DNS:test.local" -out certs/leaf.csr
+cd ~/trust-anchor
+
+openssl req -new \
+  -newkey ec \
+  -pkeyopt ec_paramgen_curve:prime256v1 \
+  -nodes \
+  -keyout certs/leaf.key \
+  -subj "/CN=test.local" \
+  -addext "subjectAltName=DNS:test.local" \
+  -out certs/leaf.csr
 ```
 
-## Running the project
+## Running the demonstration
 
-Open two terminals. Run this in both:
+Open two terminals and prepare both environments:
 
 ```bash
-cd ~/ca && source env.sh && source venv/bin/activate
-export SOFTHSM2_CONF=~/ca/issuing.conf HSM_PIN=5678
+cd ~/trust-anchor
+source env.sh
+source venv/bin/activate
+export SOFTHSM2_CONF=~/trust-anchor/issuing.conf
+export HSM_PIN=5678
 cd mofn
 ```
 
-**Terminal 1:** start the gateway and leave it running.
+### Terminal 1: start the gateway
 
 ```bash
 python gateway.py
 ```
 
-**Terminal 2:** submit a request and note the printed `request_id`.
+### Terminal 2: submit a request
 
 ```bash
 python requester.py submit ../certs/leaf.csr 24 web1
-RID=<the request_id, without angle brackets>
 ```
 
-Try to issue before approval. It must be denied.
+Save the returned request ID:
 
 ```bash
-python requester.py issue $RID ../certs/test.crt
+RID=<request-id>
 ```
 
-Approve as three different approvers. Each is shown the domains read from the CSR
-itself and must type the first domain to confirm.
+An issuance attempt without sufficient approval must be rejected:
 
 ```bash
-python approver.py approver1 $RID
-python approver.py approver2 $RID
-python approver.py approver3 $RID
+python requester.py issue "$RID" ../certs/test.crt
 ```
 
-Issue the certificate and verify it:
+Approve the request with three different approvers:
 
 ```bash
-python requester.py issue $RID ../certs/test.crt
-openssl verify -CAfile ../certs/root.crt -untrusted ../certs/issuing.crt ../certs/test.crt
-openssl x509 -in ../certs/test.crt -noout -text | grep -E "Not After|status_request|DNS:"
+python approver.py approver1 "$RID"
+python approver.py approver2 "$RID"
+python approver.py approver3 "$RID"
 ```
 
-Issuing the same request again is denied as a replay.
+Each approver is shown the domains extracted from the CSR and must confirm the
+first domain.
 
-## Expected results
+Issue and verify the certificate:
 
-| Step | Result |
+```bash
+python requester.py issue "$RID" ../certs/test.crt
+
+openssl verify \
+  -CAfile ../certs/root.crt \
+  -untrusted ../certs/issuing.crt \
+  ../certs/test.crt
+
+openssl x509 -in ../certs/test.crt -noout -text |
+  grep -E "Not After|status_request|DNS:"
+```
+
+A second attempt to issue the same request must be rejected as a replay.
+
+## Expected behavior
+
+| Test | Expected result |
 |---|---|
-| Issue with 0 or 2 approvals | `403`, not enough valid distinct approvals |
-| Issue with 3 approvals | Certificate written; `verify` says `OK` |
-| Certificate contents | About 24h validity, `status_request` (Must-Staple), `DNS:test.local` |
-| Issue the same request again | `403`, replay |
+| Zero approvals | Request rejected |
+| Two approvals | Request rejected |
+| Three distinct valid approvals | Certificate issued |
+| Certificate validity | Approximately 24 hours |
+| Certificate extensions | OCSP Must-Staple and `DNS:test.local` |
+| Repeated issuance | Rejected as a replay |
 
-## Evidence tests
+## Security and integrity tests
 
-**Key non-extractability**
+### Verify key protection
 
 ```bash
-export SOFTHSM2_CONF=~/ca/issuing.conf
-pkcs11-tool --module $P11MOD --token-label issuingCA --login --pin 5678 --list-objects
+export SOFTHSM2_CONF=~/trust-anchor/issuing.conf
+
+pkcs11-tool --module "$P11MOD" \
+  --token-label issuingCA \
+  --login \
+  --pin 5678 \
+  --list-objects
+
 python ../extract_test.py
 ```
 
-Expect `never extractable`, `EXTRACTABLE: False`, and a refused read of the key value.
+The output should indicate that the key is non-extractable and that reading the
+private key value is refused.
 
-**Attack suite** (simulates a fully compromised gateway)
+### Run the attack suite
 
 ```bash
-cd ~/ca/mofn
+cd ~/trust-anchor/mofn
 python attack_tests.py
 ```
 
-Expect `10/10 tests behaved as expected` and `audit chain intact: True`. The tests cover:
+The suite covers:
 
-1. Legitimate 3-of-5 issuance succeeds
-2. Replay of the same approvals
-3. Only 2 approvals
-4. One approver signing three times
+1. Successful issuance with three approvals
+2. Approval replay
+3. Insufficient approvals
+4. Duplicate approval attempts
 5. Forged signatures
-6. CSR swapped after approval
-7. Request edited after approval (24h to 72h)
-8. Expired request
-9. Validity above the 72h cap
-10. A domain outside policy (`google.com`), the DigiNotar scenario
+6. CSR replacement after approval
+7. Request modification after approval
+8. Expired requests
+9. Excessive certificate validity
+10. Domains outside the configured policy
 
-**Audit log tamper test:** change one character in `mofn/audit.log`, then run
-`python -c "import signer; print(signer.verify_audit())"`. It reports the broken line.
+The expected result is:
+
+```text
+10/10 tests behaved as expected
+audit chain intact: True
+```
+
+### Test audit-log tampering
+
+Modify one character in `mofn/audit.log`, then run:
+
+```bash
+python -c "import signer; print(signer.verify_audit())"
+```
+
+The verification routine should identify the broken chain entry.
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Problem | Resolution |
 |---|---|
-| `Connection refused` from the requester | Start `gateway.py` in Terminal 1 first |
-| `KeyError: 'P11MOD'` or `'HSM_PIN'` | Run `source ~/ca/env.sh` and `export HSM_PIN=5678` |
-| `NoSuchToken` | `SOFTHSM2_CONF` must point to the right config for that step |
-| `ModuleNotFoundError: common` | Run the scripts from inside `~/ca/mofn` |
-| Reruns report "replay" | Delete `mofn/signer_state.db` between demos |
-| OpenSSL segfaults using `-provider pkcs11` | Known issue with the packaged provider. This project signs through Python PKCS#11 instead |
-| `explicit ECC parameters` error | Known issue with the OpenSSL PKCS#11 engine. Same workaround |
+| Requester reports connection refused | Start `gateway.py` first |
+| `KeyError: P11MOD` | Run `source ~/trust-anchor/env.sh` |
+| `KeyError: HSM_PIN` | Export `HSM_PIN=5678` |
+| `NoSuchToken` | Check `SOFTHSM2_CONF` |
+| `ModuleNotFoundError: common` | Run commands from `mofn` |
+| Requests remain marked as replayed | Remove `mofn/signer_state.db` for a fresh demonstration |
+| PKCS#11 provider causes an OpenSSL crash | Use the Python PKCS#11 implementation |
+| OpenSSL reports explicit ECC parameters | Use the Python PKCS#11 signing path |
 
-## Limitations
+## Known limitations
 
-- SoftHSM enforces non-extractability in software and gives no tamper resistance.
-  A production deployment needs a real HSM (YubiHSM 2, Nitrokey HSM, or a cloud HSM).
-- Approver keys are software keys. Production would use hardware tokens or WebAuthn.
-- The gateway and signer currently run on one host. Phase 3 separates them with mTLS.
-- A compromised signer host can still request signatures from the HSM. Phase 2b
-  seals the PIN, and Phase 5 adds a monitor that flags certificates without approvals.
-- Browsers do not consistently enforce OCSP Must-Staple. Short certificate lifetimes
-  are the primary defense, and hard-fail Must-Staple is enforced only in a controlled client.
+- SoftHSM2 provides software emulation rather than physical tamper resistance.
+- Production deployments should use a hardware or cloud HSM.
+- Approval keys are stored as software keys in this demonstration.
+- Production approvers should use hardware tokens or WebAuthn.
+- The gateway and signer currently share one host.
+- A compromised signer host may still attempt to access the HSM.
+- Browser enforcement of OCSP Must-Staple is inconsistent.
+- Short certificate lifetimes are the primary protection against delayed
+  revocation.
 
-## License and disclaimer
+## Disclaimer
 
-Educational prototype built for a case-study project. Not for production use.
-EOT
-EOF
+TrustAnchor is an educational prototype and is not intended for production
+certificate-authority operations without additional security review, isolation,
+monitoring, key management, and operational controls.
